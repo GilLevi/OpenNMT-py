@@ -208,6 +208,264 @@ class Encoder(nn.Module):
             return hidden_t, outputs
 
 
+
+class EncoderVideo(nn.Module):
+    """
+    Encoder recurrent neural network.
+    """
+    def __init__(self, opt):
+        # Number of rnn layers.
+        self.layers = opt.layers
+	input_size = opt.input_size
+        # Use a bidirectional model.
+        self.num_directions = 2 if opt.brnn else 1
+        assert opt.rnn_size % self.num_directions == 0
+
+        # Size of the encoder RNN.
+        self.hidden_size = opt.rnn_size // self.num_directions
+
+        super(EncoderVideo, self).__init__()
+        #self.embeddings = Embeddings(opt, dicts, feature_dicts)
+
+        #input_size = self.embeddings.embedding_size
+
+        # The Encoder RNN.
+        self.encoder_layer = opt.encoder_layer
+
+	self.rnn = getattr(nn, opt.rnn_type)(
+	     input_size, self.hidden_size,
+	     num_layers=opt.layers,
+	     dropout=opt.dropout,
+	     bidirectional=opt.brnn)
+
+    def forward(self, input, lengths=None, hidden=None):
+        """
+        Args:
+            input (LongTensor): len x batch x nfeat
+            lengths (LongTensor): batch
+            hidden: Initial hidden state.
+
+        Returns:
+            hidden_t (FloatTensor): Pair of layers x batch x rnn_size - final
+                                    Encoder state
+            outputs (FloatTensor):  len x batch x rnn_size -  Memory bank
+        """
+        # CHECKS
+        s_len, n_batch, n_feats = input.size()
+        if lengths is not None:
+            _, n_batch_ = lengths.size()
+            aeq(n_batch, n_batch_)
+        # END CHECKS
+
+        #emb = self.embeddings(input)
+        emb = input
+	s_len, n_batch, vec_size = emb.size()
+
+            # Standard RNN encoder.
+	packed_emb = emb
+	if lengths is not None:
+	    # Lengths data is wrapped inside a Variable.
+	    lengths = lengths.data.view(-1).tolist()
+	    packed_emb = pack(emb, lengths)
+	outputs, hidden_t = self.rnn(packed_emb, hidden)
+	if lengths:
+	    outputs = unpack(outputs)[0]
+	return hidden_t, outputs
+
+class DecoderVideo(nn.Module):
+    """
+    Decoder + Attention recurrent neural network.
+    """
+
+    def __init__(self, opt):
+        """
+        Args:
+            opt: model options
+            dicts: Target `Dict` object
+        """
+        self.layers = opt.layers
+        self.decoder_layer = opt.decoder_layer
+        self._coverage = opt.coverage_attn
+        self.hidden_size = opt.rnn_size
+        self.input_feed = opt.input_feed
+        input_size = opt.word_vec_size
+        if self.input_feed:
+            input_size += opt.rnn_size
+
+        super(DecoderVideo, self).__init__()
+        #self.embeddings = Embeddings(opt, dicts, None)
+
+	if opt.rnn_type == "LSTM":
+	    stackedCell = onmt.modules.StackedLSTM
+	else:
+	    stackedCell = onmt.modules.StackedGRU
+	self.rnn = stackedCell(opt.layers, input_size,
+			       opt.rnn_size, opt.dropout)
+	self.context_gate = None
+	if opt.context_gate is not None:
+	    self.context_gate = ContextGateFactory(
+		opt.context_gate, input_size,
+		opt.rnn_size, opt.rnn_size,
+		opt.rnn_size
+	    )
+
+        self.dropout = nn.Dropout(opt.dropout)
+
+        # Std attention layer.
+        self.attn = onmt.modules.GlobalAttention(opt.rnn_size,
+                                                 coverage=self._coverage,
+                                                 attn_type=opt.attention_type)
+
+        # Separate Copy Attention.
+        self._copy = False
+        if opt.copy_attn:
+            self.copy_attn = onmt.modules.GlobalAttention(
+                opt.rnn_size, attn_type=opt.attention_type)
+            self._copy = True
+
+    def forward(self, input, src, context, state):
+        """
+        Forward through the decoder.
+
+        Args:
+            input (LongTensor):  (len x batch) -- Input tokens
+            src (LongTensor)
+            context:  (src_len x batch x rnn_size)  -- Memory bank
+            state: an object initializing the decoder.
+
+        Returns:
+            outputs: (len x batch x rnn_size)
+            final_states: an object of the same form as above
+            attns: Dictionary of (src_len x batch)
+        """
+        # CHECKS
+        t_len, n_batch = input.size()
+        s_len, n_batch_, _ = src.size()
+        s_len_, n_batch__, _ = context.size()
+        aeq(n_batch, n_batch_, n_batch__)
+        # aeq(s_len, s_len_)
+        # END CHECKS
+
+        #emb = self.embeddings(input.unsqueeze(2))
+	emb = input
+        # n.b. you can increase performance if you compute W_ih * x for all
+        # iterations in parallel, but that's only possible if
+        # self.input_feed=False
+        outputs = []
+
+        # Setup the different types of attention.
+        attns = {"std": []}
+        if self._copy:
+            attns["copy"] = []
+        if self._coverage:
+            attns["coverage"] = []
+
+	assert isinstance(state, RNNDecoderState)
+	output = state.input_feed.squeeze(0)
+	hidden = state.hidden
+	# CHECKS
+	n_batch_, _ = output.size()
+	aeq(n_batch, n_batch_)
+	# END CHECKS
+
+	coverage = state.coverage.squeeze(0) \
+	    if state.coverage is not None else None
+
+	# Standard RNN decoder.
+	for i, emb_t in enumerate(emb.split(1)):
+	    emb_t = emb_t.squeeze(0)
+	    if self.input_feed:
+		emb_t = torch.cat([emb_t, output], 1)
+
+	    rnn_output, hidden = self.rnn(emb_t, hidden)
+	    attn_output, attn = self.attn(rnn_output,
+					  context.transpose(0, 1))
+	    if self.context_gate is not None:
+		output = self.context_gate(
+		    emb_t, rnn_output, attn_output
+		)
+		output = self.dropout(output)
+	    else:
+		output = self.dropout(attn_output)
+	    outputs += [output]
+	    attns["std"] += [attn]
+
+	    # COVERAGE
+	    if self._coverage:
+		coverage = coverage + attn \
+			   if coverage is not None else attn
+		attns["coverage"] += [coverage]
+
+	    # COPY
+	    if self._copy:
+		_, copy_attn = self.copy_attn(output,
+					      context.transpose(0, 1))
+		attns["copy"] += [copy_attn]
+            state = RNNDecoderState(hidden, output.unsqueeze(0),
+                                    coverage.unsqueeze(0)
+                                    if coverage is not None else None)
+            outputs = torch.stack(outputs)
+            for k in attns:
+                attns[k] = torch.stack(attns[k])
+        return outputs, state, attns
+
+
+
+class NMTModel(nn.Module):
+    def __init__(self, encoder, decoder, multigpu=False):
+        self.multigpu = multigpu
+        super(NMTModel, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def _fix_enc_hidden(self, h):
+        """
+        The encoder hidden is  (layers*directions) x batch x dim
+        We need to convert it to layers x batch x (directions*dim)
+        """
+        if self.encoder.num_directions == 2:
+            h = torch.cat([h[0:h.size(0):2], h[1:h.size(0):2]], 2)
+        return h
+
+    def init_decoder_state(self, context, enc_hidden):
+        if self.decoder.decoder_layer == "transformer":
+            return TransformerDecoderState()
+        elif isinstance(enc_hidden, tuple):
+            dec = RNNDecoderState(tuple([self._fix_enc_hidden(enc_hidden[i])
+                                         for i in range(len(enc_hidden))]))
+        else:
+            dec = RNNDecoderState(self._fix_enc_hidden(enc_hidden))
+        dec.init_input_feed(context, self.decoder.hidden_size)
+        return dec
+
+    def forward(self, src, tgt, lengths, dec_state=None):
+        """
+        Args:
+            src, tgt, lengths
+            dec_state: A decoder state object
+
+        Returns:
+            outputs (FloatTensor): (len x batch x rnn_size) -- Decoder outputs.
+            attns (FloatTensor): Dictionary of (src_len x batch)
+            dec_hidden (FloatTensor): tuple (1 x batch x rnn_size)
+                                      Init hidden state
+        """
+        src = src
+        tgt = tgt[:-1]  # exclude last target from inputs
+        enc_hidden, context = self.encoder(src, lengths)
+        enc_state = self.init_decoder_state(context, enc_hidden)
+        out, dec_state, attns = self.decoder(tgt, src, context,
+                                             enc_state if dec_state is None
+                                             else dec_state)
+        if self.multigpu:
+            # Not yet supported on multi-gpu
+            dec_state = None
+            attns = None
+        return out, attns, dec_state
+
+
+
+
 class Decoder(nn.Module):
     """
     Decoder + Attention recurrent neural network.
